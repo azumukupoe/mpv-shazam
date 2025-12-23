@@ -45,24 +45,28 @@ local continuous_recognition = false
 local error_count = 0
 local last_metadata = nil
 local last_osd_message = nil
-local max_errors = 3
+local max_errors = 2
 local og_geometry
 local og_snapwindow
 local osd_overlay = mp.create_osd_overlay("ass-events")
 local osd_timeout = 3
 local osd_timer = nil
 local recognition_timer = nil
-local recognizing = false
+local active_recognitions = 0
+local max_concurrency = 2
 local size = 540
 local stop_recognition = false
 local video = true
 local video_window_visible = false
+local cover_art_added = false
 
 local function is_video_window_visible()
     if mp.get_property("term-size") == nil then
         video_window_visible = true
     end
 end
+
+local pending_metadata = nil
 
 local function update_osd(text, timeout)
     if last_osd_message ~= text then
@@ -86,139 +90,49 @@ local function update_osd(text, timeout)
     end
 end
 
-local function handle_recognition_result(success, result)
-    recognizing = false
-
-    if stop_recognition then
-        stop_recognition = false
-        return
+local function process_path(path)
+    if not path then return nil end
+    if not path:find("^edl://") then
+        return path
     end
-
-    if not success or result.status ~= 0 then
-        mp.msg.error("Python script failed or crashed")
-        error_count = error_count + 1
-    else
-        local json = utils.parse_json(result.stdout)
-        if not json or json.error then
-            if json and json.error then
-                mp.msg.warn("Shazam error: " .. json.error)
-            end
-            error_count = error_count + 1
-        else
-            error_count = 0
-
-            local new_metadata = {
-                title = json.title,
-                artist = json.artist,
-                album = json.album,
-                year = json.year,
-                genre = json.genre,
-                label = json.label,
-                cover = json.cover,
-                link = json.link
-            }
-
-            if utils.to_string(last_metadata) ~= utils.to_string(new_metadata) then
-                last_metadata = new_metadata
-            else
-                return
-            end
-
-            if stop_recognition then
-                stop_recognition = false
-                return
-            end
-
-            mp.set_property("file-local-options/force-media-title",
-                string.format("%s - %s", new_metadata.artist, new_metadata.title))
-
-            if video_window_visible then
-                local osd_message = string.format(
-                    "{\\b1}\"%s\"\\N\\N%s{\\b0}\\N\\N%s (%s)\\N\\N%s\\N\\N%s",
-                    new_metadata.title, new_metadata.artist, new_metadata.album, new_metadata.year,
-                    new_metadata.genre, new_metadata.label
-                )
-                if continuous_recognition then
-                    update_osd(osd_message, false)
-                else
-                    update_osd(osd_message)
-                end
-                if not video then
-                    mp.command("video-remove")
-                    local cover_url = new_metadata.cover
-                    if cover_url ~= "No Cover" then
-                        cover_url = cover_url:gsub("(%d+)x%1cc%.jpg$", string.format("%dx%dcc.jpg", size, size))
-                        mp.commandv("video-add", cover_url, "cached", new_metadata.title, "en", "yes")
-                    end
-                end
-            else
-                local osd_message = string.format(
-                    "\n\"%s\"\n\n%s\n\n%s (%s)\n\n%s\n\n%s\n\n%s\n",
-                    new_metadata.title, new_metadata.artist, new_metadata.album, new_metadata.year,
-                    new_metadata.genre, new_metadata.label, new_metadata.link or ""
-                )
-                mp.osd_message(osd_message, 999)
-            end
-            return
-        end
+    
+    -- Strip edl://
+    path = path:sub(7)
+    
+    -- Look for %length%content pattern
+    -- The pattern %d+ captures the digits between % signs
+    local s, e, len = path:find("%%(%d+)%%")
+    if s and len then
+        -- Extract the content based on the length
+        local content = path:sub(e + 1, e + tonumber(len))
+        return content
     end
-
-    if error_count >= max_errors then
-        last_metadata = nil
-        mp.set_property("file-local-options/force-media-title", "")
-        if video_window_visible then
-            if continuous_recognition then
-                update_osd("Shazam: Song Recognition Failed", false)
-            else
-                update_osd("Shazam: Song Recognition Failed")
-            end
-            if not video then
-                mp.command("video-remove")
-            end
-        else
-            mp.osd_message("\nShazam: Song Recognition Failed\n", 999)
-        end
+    
+    -- Fallback: If no length syntax, try to find the last part after semicolons
+    -- This handles cases like edl://!header;url
+    local last_part = path:match(".*;(.*)")
+    if last_part then
+        -- Trim whitespace
+        return last_part:match("^%s*(.-)%s*$")
     end
-end
-
-local function handle_ffmpeg_result(success, result)
-    if stop_recognition then
-        recognizing = false
-        stop_recognition = false
-        return
-    end
-
-    if not success or result.status ~= 0 then
-        mp.msg.error("FFmpeg failed to capture audio")
-        recognizing = false
-        return
-    end
-
-    if not continuous_recognition then
-        if video_window_visible then
-            update_osd("Shazam: Identifying...", false)
-        else
-            mp.osd_message("\nShazam: Identifying...\n", 999)
-        end
-    end
-
-    mp.command_native_async({
-        name = "subprocess",
-        args = { python, recognizer, temp_audio },
-        capture_stdout = true,
-        capture_stderr = true,
-        playback_only = false
-    }, handle_recognition_result)
+    
+    return path
 end
 
 local function recognize_song()
-    if recognizing then return end
-    recognizing = true
+    if active_recognitions >= max_concurrency then return end
+    active_recognitions = active_recognitions + 1
 
     if stop_recognition then
         stop_recognition = false
-        recognizing = false
+        active_recognitions = active_recognitions - 1
         return
+    end
+
+    if mp.get_property("vid") == "no" or cover_art_added then
+        video = false
+    else
+        video = true
     end
 
     if mp.get_property("aid") == "no" then
@@ -228,24 +142,192 @@ local function recognize_song()
         else
             mp.osd_message("\nNo Audio Track\n", 3)
         end
-        recognizing = false
+        active_recognitions = active_recognitions - 1
         return
     end
 
     if not continuous_recognition then
         if video_window_visible then
-            if mp.get_property("vid") == "no" then
-                video = false
-            end
             update_osd("Shazam: Listening...", false)
         else
             mp.osd_message("\nShazam: Listening...\n", 999)
         end
     end
 
+    -- Create unique temp file
+    local unique_temp_audio = utils.join_path(os.getenv("TMP") or os.getenv("TEMP") or "/tmp", 
+        string.format("mpv_shazam_%d_%d.wav", os.time(), math.random(1000, 9999)))
+
+    local function cleanup()
+        os.remove(unique_temp_audio)
+        active_recognitions = active_recognitions - 1
+        if active_recognitions < 0 then active_recognitions = 0 end
+    end
+
+    local function handle_recognition_result(success, result)
+        cleanup()
+    
+        if stop_recognition then
+            stop_recognition = false
+            return
+        end
+    
+        if not success or result.status ~= 0 then
+            mp.msg.error("Python script failed or crashed")
+            error_count = error_count + 1
+            pending_metadata = nil -- Reset pending on error
+        else
+            local json = utils.parse_json(result.stdout)
+            if not json or json.error then
+                if json and json.error then
+                    mp.msg.warn("Shazam error: " .. json.error)
+                end
+                error_count = error_count + 1
+                pending_metadata = nil -- Reset pending on error
+            else
+                error_count = 0
+    
+                local new_metadata = {
+                    title = json.title,
+                    artist = json.artist,
+                    album = json.album,
+                    year = json.year,
+                    genre = json.genre,
+                    label = json.label,
+                    cover = json.cover,
+                    link = json.link
+                }
+                
+                -- Double check logic for continuous recognition
+                if continuous_recognition then
+                    if not pending_metadata or utils.to_string(pending_metadata) ~= utils.to_string(new_metadata) then
+                        pending_metadata = new_metadata
+                        return -- Wait for confirmation
+                    end
+                end
+                -- If we are here, either manual mode (immediate) or confirmed pending metadata
+                pending_metadata = new_metadata
+    
+                if utils.to_string(last_metadata) ~= utils.to_string(new_metadata) then
+                    last_metadata = new_metadata
+                else
+                    return
+                end
+    
+                if stop_recognition then
+                    stop_recognition = false
+                    return
+                end
+    
+                mp.set_property("file-local-options/force-media-title",
+                    string.format("%s - %s", new_metadata.artist, new_metadata.title))
+    
+                if video_window_visible then
+                    local osd_message = string.format(
+                        "{\\b1}\"%s\"\\N\\N%s{\\b0}\\N\\N%s (%s)\\N\\N%s\\N\\N%s",
+                        new_metadata.title, new_metadata.artist, new_metadata.album, new_metadata.year,
+                        new_metadata.genre, new_metadata.label
+                    )
+                    if continuous_recognition then
+                        update_osd(osd_message, false)
+                    else
+                        update_osd(osd_message)
+                    end
+                    if not video then
+                        mp.command("video-remove")
+                        cover_art_added = false
+                        local cover_url = new_metadata.cover
+                        if cover_url ~= "No Cover" then
+                            cover_url = cover_url:gsub("(%d+)x%1cc%.jpg$", string.format("%dx%dcc.jpg", size, size))
+                            mp.commandv("video-add", cover_url, "cached", new_metadata.title, "en", "yes")
+                            cover_art_added = true
+                        end
+                    end
+                else
+                    local osd_message = string.format(
+                        "\n\"%s\"\n\n%s\n\n%s (%s)\n\n%s\n\n%s\n\n%s\n",
+                        new_metadata.title, new_metadata.artist, new_metadata.album, new_metadata.year,
+                        new_metadata.genre, new_metadata.label, new_metadata.link or ""
+                    )
+                    mp.osd_message(osd_message, 999)
+                end
+                return
+            end
+        end
+    
+        if error_count >= max_errors or not continuous_recognition then
+            -- Only clear if we are consistently failing and no other recognition is pending
+            -- Or if we are in manual mode (not continuous)
+            
+            last_metadata = nil
+            pending_metadata = nil
+            mp.set_property("file-local-options/force-media-title", "")
+            if video_window_visible then
+                if continuous_recognition then
+                    update_osd("Shazam: Song Recognition Failed", false)
+                else
+                    update_osd("Shazam: Song Recognition Failed")
+                end
+                if not video then
+                    mp.command("video-remove")
+                    cover_art_added = false
+                end
+            else
+                mp.osd_message("\nShazam: Song Recognition Failed\n", 999)
+            end
+        end
+    end
+
+    local function handle_ffmpeg_result(success, result)
+        if stop_recognition then
+            stop_recognition = false
+            cleanup()
+            return
+        end
+    
+        if not success or result.status ~= 0 then
+            mp.msg.error("FFmpeg failed to capture audio")
+            handle_recognition_result(false, {status = -1})
+            return
+        end
+    
+        if not continuous_recognition then
+            if video_window_visible then
+                update_osd("Shazam: Identifying...", false)
+            else
+                mp.osd_message("\nShazam: Identifying...\n", 999)
+            end
+        end
+    
+        mp.command_native_async({
+            name = "subprocess",
+            args = { python, recognizer, unique_temp_audio },
+            capture_stdout = true,
+            capture_stderr = true,
+            playback_only = false
+        }, handle_recognition_result)
+    end
+
+    local time_pos = mp.get_property("time-pos")
+    local seekable = mp.get_property("seekable")
+    local path = process_path(mp.get_property("stream-path"))
+    
+    local args = { "ffmpeg", "-y" }
+
+    if time_pos and seekable == "yes" then
+        table.insert(args, "-ss")
+        table.insert(args, tostring(time_pos))
+    end
+
+    table.insert(args, "-i")
+    table.insert(args, path)
+    table.insert(args, "-t")
+    table.insert(args, tostring(capture_length))
+    table.insert(args, unique_temp_audio)
+
     mp.command_native_async({
         name = "subprocess",
-        args = { "ffmpeg", "-y", "-i", mp.get_property("path"), "-t", tostring(capture_length), temp_audio },
+        args = args,
         playback_only = false
     }, handle_ffmpeg_result)
 end
@@ -278,12 +360,14 @@ local function toggle_continuous_recognition()
         stop_recognition = true
 
         last_metadata = nil
+        pending_metadata = nil
         error_count = 0
         mp.set_property("file-local-options/force-media-title", "")
         if video_window_visible then
             update_osd("Shazam: Continuous Recognition Stopped", 3)
             if not video then
                 mp.command("video-remove")
+                cover_art_added = false
                 mp.set_property("geometry", og_geometry)
                 mp.set_property("geometry", "50%:50%")
                 mp.set_property("snap-window", og_snapwindow)
@@ -299,6 +383,7 @@ local function on_file_change()
 
     stop_recognition = true
     last_metadata = nil
+    pending_metadata = nil
     error_count = 0
     mp.set_property("file-local-options/force-media-title", "")
 
@@ -306,6 +391,7 @@ local function on_file_change()
         update_osd("Shazam: File Change Detected, Restarting Recognition", false)
         if not video then
             mp.command("video-remove")
+            cover_art_added = false
         end
     else
         mp.osd_message("\nShazam: File Change Detected, Restarting Recognition\n", 999)
