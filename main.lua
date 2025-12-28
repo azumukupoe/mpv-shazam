@@ -22,7 +22,7 @@ local function get_python_path()
         return script_opts.python_path
     end
 
-    -- Try to find venv in the script directory
+    -- Check for venv in script directory
     local venv_python_win = utils.join_path(script_path, ".venv/Scripts/python.exe")
     local venv_python_unix = utils.join_path(script_path, ".venv/bin/python")
 
@@ -32,13 +32,12 @@ local function get_python_path()
         return venv_python_unix
     end
     
-    -- Fallback to system python
+    -- Fallback to system Python
     return "python"
 end
 
 local python = get_python_path()
 local recognizer = utils.join_path(script_path, "recognizer.py")
-local temp_audio = utils.join_path(os.getenv("TMP") or os.getenv("TEMP") or "/tmp", "mpv_shazam_sample.wav")
 
 local capture_length = 3
 local continuous_recognition = false
@@ -53,9 +52,23 @@ local osd_timeout = 3
 local osd_timer = nil
 local recognition_timer = nil
 local active_recognitions = 0
+local active_processes = {}
 local max_concurrency = 2
 local size = 540
 local stop_recognition = false
+
+local function abort_all_recognition()
+    stop_recognition = true
+    -- Kill all active subprocess handles
+    for i = #active_processes, 1, -1 do
+        local proc = active_processes[i]
+        if proc then
+            mp.abort_async_command(proc)
+        end
+        table.remove(active_processes, i)
+    end
+    active_recognitions = 0
+end
 local video = true
 local video_window_visible = false
 local cover_art_added = false
@@ -96,23 +109,18 @@ local function process_path(path)
         return path
     end
     
-    -- Strip edl://
+
     path = path:sub(7)
     
-    -- Look for %length%content pattern
-    -- The pattern %d+ captures the digits between % signs
+    -- Parse %length%content pattern
     local s, e, len = path:find("%%(%d+)%%")
     if s and len then
-        -- Extract the content based on the length
-        local content = path:sub(e + 1, e + tonumber(len))
-        return content
+        return path:sub(e + 1, e + tonumber(len))
     end
     
-    -- Fallback: If no length syntax, try to find the last part after semicolons
-    -- This handles cases like edl://!header;url
+    -- Fallback for edl://!header;url format
     local last_part = path:match(".*;(.*)")
     if last_part then
-        -- Trim whitespace
         return last_part:match("^%s*(.-)%s*$")
     end
     
@@ -124,7 +132,6 @@ local function recognize_song()
     active_recognitions = active_recognitions + 1
 
     if stop_recognition then
-        stop_recognition = false
         active_recognitions = active_recognitions - 1
         return
     end
@@ -154,21 +161,29 @@ local function recognize_song()
         end
     end
 
-    -- Create unique temp file
-    local unique_temp_audio = utils.join_path(os.getenv("TMP") or os.getenv("TEMP") or "/tmp", 
+    local unique_temp_audio = utils.join_path(os.getenv("TMP") or os.getenv("TEMP") or "/tmp",
         string.format("mpv_shazam_%d_%d.wav", os.time(), math.random(1000, 9999)))
 
+    local process_id = nil
+    
     local function cleanup()
         os.remove(unique_temp_audio)
         active_recognitions = active_recognitions - 1
         if active_recognitions < 0 then active_recognitions = 0 end
+        if process_id then
+            for i, proc in ipairs(active_processes) do
+                if proc == process_id then
+                    table.remove(active_processes, i)
+                    break
+                end
+            end
+        end
     end
 
     local function handle_recognition_result(success, result)
         cleanup()
     
         if stop_recognition then
-            stop_recognition = false
             return
         end
     
@@ -198,14 +213,13 @@ local function recognize_song()
                     link = json.link
                 }
                 
-                -- Double check logic for continuous recognition
+                -- Require confirmation in continuous mode
                 if continuous_recognition then
                     if not pending_metadata or utils.to_string(pending_metadata) ~= utils.to_string(new_metadata) then
                         pending_metadata = new_metadata
                         return -- Wait for confirmation
                     end
                 end
-                -- If we are here, either manual mode (immediate) or confirmed pending metadata
                 pending_metadata = new_metadata
     
                 if utils.to_string(last_metadata) ~= utils.to_string(new_metadata) then
@@ -215,7 +229,6 @@ local function recognize_song()
                 end
     
                 if stop_recognition then
-                    stop_recognition = false
                     return
                 end
     
@@ -256,8 +269,6 @@ local function recognize_song()
         end
     
         if error_count >= max_errors or not continuous_recognition then
-            -- Only clear if we are consistently failing and no other recognition is pending
-            -- Or if we are in manual mode (not continuous)
             
             last_metadata = nil
             pending_metadata = nil
@@ -280,7 +291,6 @@ local function recognize_song()
 
     local function handle_ffmpeg_result(success, result)
         if stop_recognition then
-            stop_recognition = false
             cleanup()
             return
         end
@@ -299,13 +309,14 @@ local function recognize_song()
             end
         end
     
-        mp.command_native_async({
+        process_id = mp.command_native_async({
             name = "subprocess",
             args = { python, recognizer, unique_temp_audio },
             capture_stdout = true,
             capture_stderr = true,
             playback_only = false
         }, handle_recognition_result)
+        table.insert(active_processes, process_id)
     end
 
     local time_pos = mp.get_property("time-pos")
@@ -325,15 +336,16 @@ local function recognize_song()
     table.insert(args, tostring(capture_length))
     table.insert(args, unique_temp_audio)
 
-    mp.command_native_async({
+    process_id = mp.command_native_async({
         name = "subprocess",
         args = args,
         playback_only = false
     }, handle_ffmpeg_result)
+    table.insert(active_processes, process_id)
 end
 
 local function start_continuous_recognition()
-    recognition_timer = mp.add_periodic_timer(1, recognize_song)
+    recognition_timer = mp.add_periodic_timer(1.5, recognize_song)
 end
 
 local function toggle_continuous_recognition()
@@ -357,7 +369,7 @@ local function toggle_continuous_recognition()
             recognition_timer:kill()
             recognition_timer = nil
         end
-        stop_recognition = true
+        abort_all_recognition()
 
         last_metadata = nil
         pending_metadata = nil
@@ -379,9 +391,9 @@ local function toggle_continuous_recognition()
 end
 
 local function on_file_change()
-    if not recognizing and not continuous_recognition then return end
+    if not continuous_recognition then return end
 
-    stop_recognition = true
+    abort_all_recognition()
     last_metadata = nil
     pending_metadata = nil
     error_count = 0
@@ -406,10 +418,6 @@ local function on_file_change()
         stop_recognition = false
         if continuous_recognition then
             start_continuous_recognition()
-        else
-            if recognizing or continuous_recognition then
-                recognize_song()
-            end
         end
     end)
 end
